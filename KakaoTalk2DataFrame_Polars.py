@@ -1,17 +1,49 @@
 import polars as pl
 import re
 import datetime
-
-from time import time
+from typing import (
+    List,
+)
 
 
 class KakaoTalk2DataFrame:
-    def __init__(self, path, not_user, bot_used=True, encoding='utf-8', date_format='%Y년 %m월 %d일 %p %I:%M'):
+    """
+
+
+        Parameters
+        ----------
+        path : str
+            저장된 데이터의 주소값을 입력합니다.
+
+        not_user : List[str], default None
+            분석에서 제외할 유저 이름을 입력합니다.
+
+        bot_used : bool, optional, default True
+            채팅방에서 봇을 사용하는가에 대한 bool값 입니다.
+
+        encoding : str, optional, default 'utf-8'
+            Encoding to use for UTF when reading/writing
+
+        date_format : str, optional, default "%Y년 %m월 %d일 %p %I:%M"
+            The strftime to parse time
+        """
+    def __init__(
+            self,
+            path: str,
+            *,
+            not_user: List[str] = None,
+            bot_used: bool = True,
+            encoding: str = 'utf-8',
+            date_format: str = '%Y년 %m월 %d일 %p %I:%M'
+    ):
+        self.date_format = date_format
+
         with open(path, 'r', encoding=encoding) as f:
             top = f.readline().strip()
             save_point = f.readline().strip()
             chat_raw = f.read()
             self.check = chat_raw
+
         # 타이틀 및 참여인원 파싱
         self.title, self.participants_num = top.replace(' 님과 카카오톡 대화', '').rsplit(' ', 1)
         self.participants_num = int(self.participants_num) - bot_used
@@ -21,32 +53,99 @@ class KakaoTalk2DataFrame:
         value = value.replace('오전', 'am').replace('오후', 'pm')
         self.save_point = datetime.datetime.strptime(value, date_format)
 
-        # 시간 및 발화 분리
-        date_pattern = re.compile(r'(\d{4}년 \d{1,2}월 \d{1,2}일 오[전후] \d{1,2}:\d{1,2}),?')
-        data = date_pattern.split(chat_raw)
+        data = self._text_split(chat_raw)
 
-        # 시간 파싱
-        chat_date = pl.Series(data[1::2])
-        chat_date = chat_date.str.replace('오전', 'am')
-        chat_date = chat_date.str.replace('오후', 'pm')
-        chat_date = chat_date.str.replace(',', '')
-        chat_date = chat_date.str.to_datetime(format=date_format)
+        date_ser = pl.Series(data[1::2])
+        date_ser = self._time_parsing_ko(date_ser)
 
-        # 발화자, 발화 파싱
-        chat_data = pl.Series(data[2::2])
-        chat_data = chat_data.str.replace(
+        chat_ser = pl.Series(data[2::2])
+        chat_df = self._chat_parsing(chat_ser)
+
+        # 데이터 병합
+        self.data = pl.DataFrame({
+            'date': date_ser.dt.date(),
+            'time': date_ser.dt.time(),
+            'name': chat_df.get_column('name'),
+            'event': chat_df.get_column('event'),
+            'chat': chat_df.get_column('chat'),
+        }, )
+
+        # 활동 유저
+        self.get_users(not_user=not_user)
+
+    def _text_split(
+            self,
+            text : str = None,
+
+    ) -> List[str]:
+        """
+        시간, 발화 분리
+
+        Parameters
+        ----------
+        text : str, default None
+
+        Return
+        ------
+        List[str]
+        """
+        date_pattern = r'(\d{4}년 \d{1,2}월 \d{1,2}일 오[전후] \d{1,2}:\d{1,2}),?'
+        date_pattern = re.compile(date_pattern)
+        data = date_pattern.split(text)
+        return data
+
+    def _time_parsing_ko(
+            self,
+            date_ser : pl.Series,
+    ) -> pl.Series:
+        """
+        str to Date
+
+        Parameters
+        ----------
+
+
+        Return
+        ------
+        pl.Series
+        If parsing succeeded.
+
+        """
+        date_ser = date_ser.str.replace('오전', 'am')
+        date_ser = date_ser.str.replace('오후', 'pm')
+        date_ser = date_ser.str.replace(',', '')
+        date_ser = date_ser.str.to_datetime(format=self.date_format)
+        return date_ser
+
+    def _chat_parsing(
+            self,
+            chat_ser : pl.Series,
+    ) -> pl.DataFrame:
+        """
+        str to Date
+
+        Parameters
+        ----------
+
+
+        Return
+        ------
+        pl.DataFrame
+        If parsing succeeded.
+        """
+        chat_ser = chat_ser.str.replace(
             r'(.+?)이 .+?님에서 (.+?)님으로 (.|\n)+',
             r'$2님이 $1이 되었습니다.',
         )
-        chat_data = chat_data.str.replace(
+        chat_ser = chat_ser.str.replace(
             '(채팅방 관리자)가 (메시지를 가렸습니다.)',
             r'$1님이 $2 : ',
         )
-        chat_data = chat_data.str.splitn(' : ', 2)
-        chat_data = chat_data.struct.rename_fields(['name', 'chat']).struct.unnest()
+        chat_ser = chat_ser.str.splitn(' : ', 2)
+        chat_df = chat_ser.struct.rename_fields(['name', 'chat']).struct.unnest()
 
         # 발화자, 이벤트 파싱
-        name_event = chat_data.select(
+        name_event = chat_df.select(
             pl.col('name')
             .str.extract_groups(r'((.+)님[이을](.+?습니다.)|(.+))')
         )
@@ -66,18 +165,12 @@ class KakaoTalk2DataFrame:
             pl.col('name')
             .struct[2].alias('name')
         )
-
-        # 데이터 병합
-        self.data = pl.DataFrame({
-            'date': chat_date.dt.date(),
-            'time': chat_date.dt.time(),
+        chat_df = pl.DataFrame({
             'name': name.get_column('name').str.strip_chars(),
             'event': event.get_column('name').str.strip_chars(),
-            'chat': chat_data.get_column('chat').str.strip_chars(),
-        }, )
-
-        # 활동 유저
-        self.get_users(not_user=not_user)
+            'chat': chat_df.get_column('chat').str.strip_chars(),
+        })
+        return chat_df
 
     def get_users(self, not_user=[]):
         df = self.data
@@ -106,3 +199,4 @@ if __name__ == '__main__':
         not_user=['', '방장봇', '채팅방 관리자']
     )
     print(data.data.shape)
+    print(data.data.head())
